@@ -9,3 +9,8 @@ aiohttp
 aiofiles
 pytrovich
 slowapi
+# ASR: GigaAM-v3 (Сбер) локально через ONNX Runtime (CPU)
+onnx-asr[hub]>=0.12
+onnxruntime>=1.20
+soundfile>=0.12
+numpy

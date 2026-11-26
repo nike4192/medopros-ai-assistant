@@ -4,10 +4,11 @@ FROM python:3.12-slim
 # Рабочая директория
 WORKDIR /app
 
-# Системные зависимости для аудио (ffmpeg, libsndfile)
+# Системные зависимости для аудио (ffmpeg, libsndfile) и onnxruntime (libgomp)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Сначала копируем зависимости

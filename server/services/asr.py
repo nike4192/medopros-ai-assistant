@@ -1,25 +1,111 @@
-import httpx
-import base64
+"""Распознавание речи VisitAI.
+
+Основной движок — GigaAM-v3 (Сбер) локально через `onnx-asr` (ONNX int8, CPU).
+Прежний движок Whisper через OpenRouter остаётся запасным (`ASR_FALLBACK_OPENROUTER`)
+или основным при `ASR_ENGINE=openrouter`.
+"""
+
 import asyncio
-from ..config import OPENROUTER_API_KEY, AUDIO_MODEL, FALLBACK_AUDIO_MODELS, SITE_URL, SITE_NAME
+import base64
+import threading
+import time
+
+import httpx
+
+from ..config import (
+    ASR_ENGINE,
+    ASR_FALLBACK_OPENROUTER,
+    AUDIO_MODEL,
+    FALLBACK_AUDIO_MODELS,
+    GIGAAM_MAX_SPEECH_S,
+    GIGAAM_MODEL,
+    GIGAAM_QUANTIZATION,
+    OPENROUTER_API_KEY,
+    SITE_NAME,
+    SITE_URL,
+)
+
+# --- GigaAM -----------------------------------------------------------------
+
+_gigaam_model = None
+_gigaam_vad = None
+_gigaam_load_lock = threading.Lock()
+_gigaam_infer_lock = threading.Lock()
+
+
+def load_gigaam() -> None:
+    """Загрузить модель и VAD (идемпотентно, потокобезопасно)."""
+    global _gigaam_model, _gigaam_vad
+    if _gigaam_model is not None:
+        return
+    with _gigaam_load_lock:
+        if _gigaam_model is not None:
+            return
+        import onnx_asr
+
+        started = time.monotonic()
+        print(f"🎙️ GigaAM: загружаю {GIGAAM_MODEL} ({GIGAAM_QUANTIZATION or 'fp32'})…")
+        model = onnx_asr.load_model(
+            GIGAAM_MODEL,
+            providers=["CPUExecutionProvider"],
+            **({"quantization": GIGAAM_QUANTIZATION} if GIGAAM_QUANTIZATION else {}),
+        )
+        vad = onnx_asr.load_vad("silero", providers=["CPUExecutionProvider"])
+        _gigaam_model, _gigaam_vad = model, vad
+        print(f"✅ GigaAM готова за {time.monotonic() - started:.1f} с")
+
+
+def warmup_gigaam() -> None:
+    """Прогрев в фоне при старте приложения: первый запрос не платит за загрузку."""
+    try:
+        load_gigaam()
+    except Exception as exc:  # noqa: BLE001 — сервис должен подняться даже без модели
+        print(f"⚠️ GigaAM: прогрев не удался: {exc}")
+
+
+def _transcribe_gigaam_sync(wav_path: str) -> str:
+    """Синхронное распознавание WAV 16 кГц mono (вызывать в отдельном потоке)."""
+    import soundfile as sf
+
+    load_gigaam()
+    audio, sample_rate = sf.read(wav_path, dtype="float32", always_2d=True)
+    audio = audio.mean(axis=1)
+    if sample_rate != 16000:
+        raise ValueError(f"GigaAM ждёт 16 кГц, получено {sample_rate}")
+
+    with _gigaam_infer_lock:
+        recognizer = _gigaam_model.with_vad(
+            _gigaam_vad, max_speech_duration_s=GIGAAM_MAX_SPEECH_S
+        )
+        results = list(
+            recognizer.recognize(audio, sample_rate=sample_rate)
+        )
+
+    return " ".join(
+        (result.text or "").strip() for result in results if (result.text or "").strip()
+    )
+
+
+# --- OpenRouter Whisper (запасной движок) ------------------------------------
+
 
 async def transcribe_audio_base64(wav_path: str) -> str:
     if not OPENROUTER_API_KEY:
         return ""
-    
+
     try:
         with open(wav_path, "rb") as f:
             base64_audio = base64.b64encode(f.read()).decode("utf-8")
 
         models_to_try = [AUDIO_MODEL] + [m.strip() for m in FALLBACK_AUDIO_MODELS if m.strip()]
-        
+
         unique_models = []
         for m in models_to_try:
             if m and m not in unique_models:
                 unique_models.append(m)
 
         max_retries_per_model = 5
-        
+
         last_error = "Неизвестная ошибка"
         async with httpx.AsyncClient(timeout=120.0) as client:
             for model_name in unique_models:
@@ -42,7 +128,7 @@ async def transcribe_audio_base64(wav_path: str) -> str:
                                 "prompt": "Это медицинская запись. Пациент описывает жалобы на здоровье."
                             }
                         )
-                        
+
                         if response.status_code == 200:
                             result = response.json()
                             return result.get("text", "").strip()
@@ -75,10 +161,36 @@ async def transcribe_audio_base64(wav_path: str) -> str:
         except: pass
         return ""
 
+
+# --- Диспетчер ---------------------------------------------------------------
+
+
+async def transcribe_audio_file(wav_path: str) -> str:
+    """Распознать WAV: GigaAM (по умолчанию) с откатом на OpenRouter Whisper."""
+    if ASR_ENGINE != "openrouter":
+        started = time.monotonic()
+        try:
+            text = await asyncio.to_thread(_transcribe_gigaam_sync, wav_path)
+            print(
+                f"🎙️ GigaAM: {time.monotonic() - started:.1f} с, "
+                f"символов={len(text)}"
+            )
+            return text
+        except Exception as exc:  # noqa: BLE001 — решаем, откатываться ли на Whisper
+            print(f"⚠️ GigaAM failed: {exc}")
+            if not ASR_FALLBACK_OPENROUTER:
+                raise
+
+    if not OPENROUTER_API_KEY:
+        return ""
+    print("↪️ ASR: откат на OpenRouter Whisper")
+    return await transcribe_audio_base64(wav_path)
+
+
 def filter_hallucinations(text: str) -> str:
     HALLUCINATIONS = [
-        "thank you.", "thank you", "thanks for watching.", 
-        "подпишитесь на канал", "продолжение следует", 
+        "thank you.", "thank you", "thanks for watching.",
+        "подпишитесь на канал", "продолжение следует",
         "bye.", "bye bye", "you", "..."
     ]
     cleaned_text = text.strip().lower().rstrip(".")
