@@ -1,25 +1,99 @@
-import httpx
-import base64
+"""Распознавание речи VisitAI (минимальная схема).
+
+GigaAM не грузится в этом процессе: аудио уходит HTTP-запросом во внешний
+ASR-сервис (`GIGAAM_API_URL`). Прежний Whisper через OpenRouter остаётся
+запасным движком (`ASR_FALLBACK_OPENROUTER`) или основным при
+`ASR_ENGINE=openrouter`.
+
+Контракт внешнего сервиса:
+    POST $GIGAAM_API_URL
+    multipart/form-data: <GIGAAM_API_FIELD>=@audio.wav
+    X-API-Key: $GIGAAM_API_KEY   (если задан)
+    → 200 {"text": "..."} | {"result": "..."} | {"transcript": "..."}
+      или text/plain с готовым текстом.
+"""
+
 import asyncio
-from ..config import OPENROUTER_API_KEY, AUDIO_MODEL, FALLBACK_AUDIO_MODELS, SITE_URL, SITE_NAME
+import base64
+
+import httpx
+
+from ..config import (
+    ASR_ENGINE,
+    ASR_FALLBACK_OPENROUTER,
+    AUDIO_MODEL,
+    FALLBACK_AUDIO_MODELS,
+    GIGAAM_API_FIELD,
+    GIGAAM_API_KEY,
+    GIGAAM_API_TIMEOUT,
+    GIGAAM_API_URL,
+    OPENROUTER_API_KEY,
+    SITE_NAME,
+    SITE_URL,
+)
+
+
+def extract_text(payload, content_type: str = "") -> str:
+    """Достать текст из JSON/plain-ответа внешнего ASR-сервиса."""
+    if isinstance(payload, str):
+        return payload.strip()
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("text", "result", "transcript"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict) and isinstance(value.get("text"), str):
+            return value["text"].strip()
+    return ""
+
+
+async def transcribe_gigaam_api(wav_path: str) -> str:
+    """Отправить WAV во внешний GigaAM-сервис и вернуть текст."""
+    if not GIGAAM_API_URL:
+        raise RuntimeError("GIGAAM_API_URL не задан")
+
+    with open(wav_path, "rb") as f:
+        audio = f.read()
+
+    headers = {"X-API-Key": GIGAAM_API_KEY} if GIGAAM_API_KEY else {}
+    async with httpx.AsyncClient(timeout=GIGAAM_API_TIMEOUT) as client:
+        response = await client.post(
+            GIGAAM_API_URL,
+            headers=headers,
+            files={GIGAAM_API_FIELD: ("audio.wav", audio, "audio/wav")},
+        )
+    response.raise_for_status()
+
+    content_type = response.headers.get("content-type", "")
+    if "json" in content_type:
+        try:
+            return extract_text(response.json(), content_type)
+        except ValueError:
+            pass
+    return response.text.strip()
+
+
+# --- OpenRouter Whisper (запасной движок) ------------------------------------
+
 
 async def transcribe_audio_base64(wav_path: str) -> str:
     if not OPENROUTER_API_KEY:
         return ""
-    
+
     try:
         with open(wav_path, "rb") as f:
             base64_audio = base64.b64encode(f.read()).decode("utf-8")
 
         models_to_try = [AUDIO_MODEL] + [m.strip() for m in FALLBACK_AUDIO_MODELS if m.strip()]
-        
+
         unique_models = []
         for m in models_to_try:
             if m and m not in unique_models:
                 unique_models.append(m)
 
         max_retries_per_model = 5
-        
+
         last_error = "Неизвестная ошибка"
         async with httpx.AsyncClient(timeout=120.0) as client:
             for model_name in unique_models:
@@ -42,7 +116,7 @@ async def transcribe_audio_base64(wav_path: str) -> str:
                                 "prompt": "Это медицинская запись. Пациент описывает жалобы на здоровье."
                             }
                         )
-                        
+
                         if response.status_code == 200:
                             result = response.json()
                             return result.get("text", "").strip()
@@ -75,10 +149,32 @@ async def transcribe_audio_base64(wav_path: str) -> str:
         except: pass
         return ""
 
+
+# --- Диспетчер ---------------------------------------------------------------
+
+
+async def transcribe_audio_file(wav_path: str) -> str:
+    """Распознать WAV: внешний GigaAM (по умолчанию) с откатом на Whisper."""
+    if ASR_ENGINE != "openrouter":
+        try:
+            text = await transcribe_gigaam_api(wav_path)
+            print(f"🎙️ GigaAM API: символов={len(text)}")
+            return text
+        except Exception as exc:  # noqa: BLE001 — решаем, откатываться ли на Whisper
+            print(f"⚠️ GigaAM API failed: {exc}")
+            if not ASR_FALLBACK_OPENROUTER:
+                raise
+
+    if not OPENROUTER_API_KEY:
+        return ""
+    print("↪️ ASR: откат на OpenRouter Whisper")
+    return await transcribe_audio_base64(wav_path)
+
+
 def filter_hallucinations(text: str) -> str:
     HALLUCINATIONS = [
-        "thank you.", "thank you", "thanks for watching.", 
-        "подпишитесь на канал", "продолжение следует", 
+        "thank you.", "thank you", "thanks for watching.",
+        "подпишитесь на канал", "продолжение следует",
         "bye.", "bye bye", "you", "..."
     ]
     cleaned_text = text.strip().lower().rstrip(".")

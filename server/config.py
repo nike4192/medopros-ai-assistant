@@ -14,6 +14,19 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 1 week
 # --- AI Models ---
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 GPT_MODEL = os.getenv("GPT_MODEL", "openrouter/free")
+
+# --- ASR ---
+# gigaam_api — внешний HTTP-сервис GigaAM (модель НЕ грузится в этом процессе);
+# openrouter — прежний Whisper через OpenRouter.
+ASR_ENGINE = (os.getenv("ASR_ENGINE") or "gigaam_api").strip().lower()
+GIGAAM_API_URL = (os.getenv("GIGAAM_API_URL") or "").strip()
+GIGAAM_API_KEY = os.getenv("GIGAAM_API_KEY")
+GIGAAM_API_TIMEOUT = float(os.getenv("GIGAAM_API_TIMEOUT", "300"))
+GIGAAM_API_FIELD = os.getenv("GIGAAM_API_FIELD", "file")
+# Если внешний GigaAM недоступен — откатиться на Whisper через OpenRouter.
+ASR_FALLBACK_OPENROUTER = os.getenv("ASR_FALLBACK_OPENROUTER", "1").strip().lower() not in ("0", "false", "no")
+
+# Параметры OpenRouter (используются при ASR_ENGINE=openrouter или как fallback)
 AUDIO_MODEL = os.getenv("AUDIO_MODEL", "openai/whisper-large-v3-turbo")
 FALLBACK_AUDIO_MODELS = os.getenv("FALLBACK_AUDIO_MODELS", "google/chirp-3,nvidia/parakeet-tdt-0.6b-v3,openai/whisper-1").split(",")
 

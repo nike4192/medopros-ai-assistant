@@ -30,11 +30,11 @@ from slowapi.errors import RateLimitExceeded
 from .config import (
     PORT, SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES,
     LOGIN_USER, LOGIN_PASSWORD, RECORDINGS_DIR, FAILED_DIR, SITE_URL, SITE_NAME,
-    UGMK_API_KEY
+    UGMK_API_KEY, ASR_ENGINE, GIGAAM_API_URL
 )
 from .database import history_manager, session_manager
 from .services.llm import get_llm_summary, DOCTOR_PROMPTS, llm
-from .services.asr import transcribe_audio_base64, filter_hallucinations
+from .services.asr import transcribe_audio_file, filter_hallucinations
 from .services.notifier import send_telegram_lead, send_telegram_alert
 
 leads_lock = threading.RLock()
@@ -47,7 +47,12 @@ limiter = Limiter(key_func=get_remote_address)
 async def lifespan(app: FastAPI):
     if llm:
         print(f"🤖 LLM Initialized via OpenRouter.")
-    
+
+    if ASR_ENGINE == "gigaam_api":
+        print(f"🎙️ ASR engine: GigaAM API ({GIGAAM_API_URL or 'URL не задан'})")
+    else:
+        print("🎙️ ASR engine: OpenRouter Whisper")
+
     async def periodic_cleanup():
         while True:
             try:
@@ -237,7 +242,7 @@ async def ugmk_transcribe(file: UploadFile = File(...), x_api_key: Optional[str]
         wav_path = os.path.join(tempfile.gettempdir(), f"{record_id}_conv.wav")
         await convert_to_wav(temp_path, wav_path)
 
-        raw_text = await transcribe_audio_base64(wav_path)
+        raw_text = await transcribe_audio_file(wav_path)
         text = filter_hallucinations(raw_text)
 
         if not text or len(text.strip()) < 2:
@@ -298,7 +303,7 @@ async def transcribe_audio(
         wav_path = os.path.join(tempfile.gettempdir(), f"{record_id}_conv.wav")
         await convert_to_wav(temp_path, wav_path)
 
-        raw_text = await transcribe_audio_base64(wav_path)
+        raw_text = await transcribe_audio_file(wav_path)
         text = filter_hallucinations(raw_text)
 
         if not text or len(text.strip()) < 2:
